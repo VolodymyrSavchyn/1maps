@@ -1,0 +1,67 @@
+import pandas as pd
+import psycopg2
+import folium
+import geopandas as gpd
+from shapely.geometry import Point
+import os
+import json
+from sqlalchemy import create_engine
+from geoalchemy2 import Geometry
+
+# Перевірка, чи існує файл GeoJSON
+file_path = '/home/volodymir/Документи/data.geojson/export.geojson'
+if os.path.exists(file_path):
+    print(f"Файл {file_path} знайдений.")
+else:
+    print(f"Файл {file_path} не знайдений.")
+    exit()
+
+# Завантаження GeoJSON
+try:
+    galytskyi_district = gpd.read_file(file_path)
+    print("GeoJSON файл завантажено успішно!")
+except Exception as e:
+    print(f"Помилка завантаження файлу: {e}")
+
+# Параметри підключення до бази даних
+dbname = "bus_stops_db"
+user = "postgres"
+password = "112233"
+port = "5432"
+hosts = ["localhost", "127.0.0.1"]
+
+# Створення підключення до PostgreSQL через SQLAlchemy
+engine = create_engine(f'postgresql://{user}:{password}@localhost:{port}/{dbname}')
+
+# Завантаження зупинок Львова з CSV
+file_path_csv = '/home/volodymir/Документи/зупинки Львова/local_file.csv'
+df = pd.read_csv(file_path_csv, sep=";", encoding="windows-1251")
+df = df[['stop_id', 'settlement', 'stop_code', 'stop_name', 'stop_desc', 'stop_lat', 'stop_lon']]
+
+# Створення GeoDataFrame для зупинок Львова
+geometry = [Point(xy) for xy in zip(df['stop_lon'], df['stop_lat'])]
+geo_df = gpd.GeoDataFrame(df, geometry=geometry, crs="EPSG:4326")
+
+# Фільтрація зупинок у межах Галицького району
+stops_in_district = gpd.sjoin(geo_df, galytskyi_district, how="inner", predicate="within")
+
+# Завантаження даних у таблицю PostgreSQL (стопи Галицького району)
+stops_in_district.to_postgis('stops_in_halytskyi', engine, if_exists='replace')
+
+# Збереження результатів у CSV та GeoJSON
+stops_in_district.to_csv("/home/volodymir/Документи/stops_in_halytskyi.csv", index=False)
+stops_in_district.to_file("/home/volodymir/Документи/stops_in_halytskyi.geojson", driver="GeoJSON")
+
+# Карта всіх зупинок Львова
+m_all = folium.Map(location=[df['stop_lat'].mean(), df['stop_lon'].mean()], zoom_start=13)
+for _, row in df.iterrows():
+    folium.Marker([row['stop_lat'], row['stop_lon']], popup=row['stop_name']).add_to(m_all)
+
+m_all.save('/home/volodymir/Документи/map_all_stops.html')
+
+# Карта зупинок Галицького району
+m_galytskyi = folium.Map(location=[stops_in_district['stop_lat'].mean(), stops_in_district['stop_lon'].mean()], zoom_start=13)
+for _, row in stops_in_district.iterrows():
+    folium.Marker([row['stop_lat'], row['stop_lon']], popup=row['stop_name']).add_to(m_galytskyi)
+
+m_galytskyi.save('/home/volodymir/Документи/map_halytskyi.html')
