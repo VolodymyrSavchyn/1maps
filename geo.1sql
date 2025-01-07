@@ -1,39 +1,73 @@
 import pandas as pd
+import geopandas as gpd
 import psycopg2
 import folium
-import geopandas as gpd
 from shapely.geometry import Point
-import os
-import json
-from sqlalchemy import create_engine
 from geoalchemy2 import Geometry
+from sqlalchemy import create_engine
 
-# Перевірка, чи існує файл GeoJSON
-file_path = '/home/volodymir/Документи/data.geojson/export.geojson'
-if os.path.exists(file_path):
-    print(f"Файл {file_path} знайдений.")
-else:
-    print(f"Файл {file_path} не знайдений.")
-    exit()
+# Параметри підключення до бази даних PostgreSQL
+db_params = {
+    "dbname": "bus_stops_db",  
+    "user": "postgres",
+    "password": "112233",
+    "host": "localhost",
+    "port": 5432,
+}
 
-# Завантаження GeoJSON
-try:
-    galytskyi_district = gpd.read_file(file_path)
-    print("GeoJSON файл завантажено успішно!")
-except Exception as e:
-    print(f"Помилка завантаження файлу: {e}")
+# Підключення до PostgreSQL через psycopg2
+conn = psycopg2.connect(**db_params)
+cursor = conn.cursor()
 
-# Параметри підключення до бази даних
-dbname = "bus_stops_db"
-user = "postgres"
-password = "112233"
-port = "5432"
-hosts = ["localhost", "127.0.0.1"]
+# Завантаження GeoJSON файлу з межами Галицького району
+district_geojson_path = "/home/volodymir/Стільниця/haldistrict1.geojson"
+district_gdf = gpd.read_file(district_geojson_path)
 
-# Створення підключення до PostgreSQL через SQLAlchemy
-engine = create_engine(f'postgresql://{user}:{password}@localhost:{port}/{dbname}')
+# Перевірка даних (вивести межі району)
+print(district_gdf.head())
 
-# Завантаження зупинок Львова з CSV
+# Отримуємо геометрію району в форматі WKT для збереження в базі
+district_geom_wkt = district_gdf.geometry.iloc[0].wkt
+
+# Створення таблиці для зупинок, якщо її немає
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS lvivhal1 (
+        stop_id SERIAL PRIMARY KEY,
+        settlement CHARACTER VARYING(50),
+        stop_code CHARACTER VARYING(10),
+        stop_name CHARACTER VARYING(100),
+        stop_desc CHARACTER VARYING(200),
+        stop_lat DOUBLE PRECISION,
+        stop_lon DOUBLE PRECISION,
+        geom GEOMETRY(Point, 4326)
+    );
+""")
+conn.commit()
+
+# Створення таблиці для збереження геометрії району (якщо її немає)
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS haldistrict (
+        district_id SERIAL PRIMARY KEY,
+        name CHARACTER VARYING(100),
+        geom GEOMETRY(Polygon, 4326)
+    );
+""")
+conn.commit()
+
+# Видалення всіх записів для Галицького району перед вставкою нового (якщо є дублікат)
+cursor.execute("""
+    DELETE FROM haldistrict WHERE name = 'Галицький район';
+""")
+conn.commit()
+
+# Вставка геометрії району в таблицю (з гарантією, що буде тільки один запис для Галицького району)
+cursor.execute("""
+    INSERT INTO haldistrict (name, geom)
+    VALUES (%s, ST_GeomFromText(%s, 4326))
+    """, ("Галицький район", district_geom_wkt))
+conn.commit()
+
+# Завантаження зупинок Львова з CSV файлу
 file_path_csv = '/home/volodymir/Документи/зупинки Львова/local_file.csv'
 df = pd.read_csv(file_path_csv, sep=";", encoding="windows-1251")
 df = df[['stop_id', 'settlement', 'stop_code', 'stop_name', 'stop_desc', 'stop_lat', 'stop_lon']]
@@ -42,26 +76,51 @@ df = df[['stop_id', 'settlement', 'stop_code', 'stop_name', 'stop_desc', 'stop_l
 geometry = [Point(xy) for xy in zip(df['stop_lon'], df['stop_lat'])]
 geo_df = gpd.GeoDataFrame(df, geometry=geometry, crs="EPSG:4326")
 
-# Фільтрація зупинок у межах Галицького району
-stops_in_district = gpd.sjoin(geo_df, galytskyi_district, how="inner", predicate="within")
+# Додавання зупинок у таблицю lvivhal1
+for _, stop in geo_df.iterrows():
+    cursor.execute("""
+        INSERT INTO lvivhal1 (settlement, stop_code, stop_name, stop_desc, stop_lat, stop_lon, geom)
+        VALUES (%s, %s, %s, %s, %s, %s, ST_GeomFromText(%s, 4326));
+    """, (
+        stop['settlement'], stop['stop_code'], stop['stop_name'], stop['stop_desc'],
+        stop['stop_lat'], stop['stop_lon'], f"POINT({stop['stop_lon']} {stop['stop_lat']})"
+    ))
+conn.commit()
 
-# Завантаження даних у таблицю PostgreSQL (стопи Галицького району)
-stops_in_district.to_postgis('stops_in_halytskyi', engine, if_exists='replace')
+# Запит для вибору зупинок, що знаходяться в межах Галицького району
+# Запит для вибору зупинок, що знаходяться в межах Галицького району
+cursor.execute("""
+    SELECT stop_id, stop_name, stop_lat, stop_lon, ST_AsText(geom) 
+    FROM lvivhal1 
+    WHERE ST_Within(geom, (SELECT geom FROM haldistrict WHERE name = 'Галицький район' LIMIT 1));
+""")
 
-# Збереження результатів у CSV та GeoJSON
-stops_in_district.to_csv("/home/volodymir/Документи/stops_in_halytskyi.csv", index=False)
-stops_in_district.to_file("/home/volodymir/Документи/stops_in_halytskyi.geojson", driver="GeoJSON")
 
-# Карта всіх зупинок Львова
-m_all = folium.Map(location=[df['stop_lat'].mean(), df['stop_lon'].mean()], zoom_start=13)
-for _, row in df.iterrows():
-    folium.Marker([row['stop_lat'], row['stop_lon']], popup=row['stop_name']).add_to(m_all)
+# Отримання результатів запиту
+stops_within_district = cursor.fetchall()
 
-m_all.save('/home/volodymir/Документи/map_all_stops.html')
+# Виведення результатів
+if stops_within_district:
+    print(f"Зупинки у Галицькому районі:")
+    for stop in stops_within_district:
+        print(stop)
+else:
+    print("Не знайдено зупинок у межах Галицького району.")
 
-# Карта зупинок Галицького району
-m_galytskyi = folium.Map(location=[stops_in_district['stop_lat'].mean(), stops_in_district['stop_lon'].mean()], zoom_start=13)
-for _, row in stops_in_district.iterrows():
-    folium.Marker([row['stop_lat'], row['stop_lon']], popup=row['stop_name']).add_to(m_galytskyi)
+# Закриття підключення до бази даних
+cursor.close()
+conn.close()
 
-m_galytskyi.save('/home/volodymir/Документи/map_halytskyi.html')
+# Створення карти зупинок Львова
+lviv_lat = 49.8397  # координати Львова
+lviv_lon = 24.0297
+
+m = folium.Map(location=[lviv_lat, lviv_lon], zoom_start=12)
+
+# Додавання зупинок на карту
+for _, row in geo_df.iterrows():
+    folium.Marker([row['stop_lat'], row['stop_lon']], popup=row['stop_name']).add_to(m)
+
+# Збереження карти в HTML
+m.save('/home/volodymir/Документи/lviv_stops_map.html')
+print("Карта зупинок Львова збережена у lviv_stops_map.html.")
