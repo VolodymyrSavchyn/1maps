@@ -1,0 +1,72 @@
+import psycopg2
+import pandas as pd
+import matplotlib.pyplot as plt
+import os
+
+# Параметри підключення до бази даних PostgreSQL
+db_params = {
+    "dbname": "bus_stops_db",  
+    "user": "postgres",
+    "password": "112233",
+    "host": "localhost",
+    "port": 5432,
+}
+
+# Підключення до PostgreSQL через psycopg2
+conn = psycopg2.connect(**db_params)
+cursor = conn.cursor()
+
+# SQL запит для вибору відстаней до центру Галицького району і отримання координат
+cursor.execute("""
+    SELECT stop_id, stop_name, ST_X(geom) AS longitude, ST_Y(geom) AS latitude,
+           ST_Distance(geom, 
+                       (SELECT ST_Centroid(geom) 
+                        FROM district_geom 
+                        WHERE name = 'Галицький район' LIMIT 1)
+                       ) AS distance_to_center
+    FROM lvivhal1
+    WHERE ST_Within(geom, 
+                    (SELECT geom FROM district_geom WHERE name = 'Галицький район' LIMIT 1)
+                    );
+""")
+
+# Отримання результатів запиту
+stops_with_distances = cursor.fetchall()
+
+# Перетворення результатів у DataFrame
+df = pd.DataFrame(stops_with_distances, columns=['stop_id', 'stop_name', 'longitude', 'latitude', 'distance_to_center'])
+
+# Виведення статистики
+print(df.describe())
+
+# Отримуємо координати центру Галицького району
+cursor.execute("""
+    SELECT ST_X(ST_Centroid(geom)), ST_Y(ST_Centroid(geom))
+    FROM district_geom
+    WHERE name = 'Галицький район' LIMIT 1;
+""")
+center = cursor.fetchone()
+center_longitude = center[0]
+center_latitude = center[1]
+
+# Побудова координатної сітки
+plt.figure(figsize=(10, 6))
+plt.scatter(df['longitude'], df['latitude'], color='red', label='Зупинки', s=10)  # Зупинки
+plt.scatter(center_longitude, center_latitude, color='blue', label='Центр', s=100, marker='*')  # Центр
+
+plt.title("Зупинки в межах Галицького району")
+plt.xlabel("Довгота")
+plt.ylabel("Широта")
+plt.legend()
+plt.grid(True)
+
+# Збереження графіку
+directory = '/home/volodymir/Документи/тут графіки'
+plt.savefig(f'{directory}/bus_stops_map.png')
+
+# Показуємо графік
+plt.show()
+
+# Закриття підключення до бази даних
+cursor.close()
+conn.close()
