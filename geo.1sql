@@ -1,67 +1,73 @@
-import pandas as pd
 import psycopg2
-import folium
-import geopandas as gpd
-from shapely.geometry import Point
+import pandas as pd
+import matplotlib.pyplot as plt
 import os
-import json
-from sqlalchemy import create_engine
-from geoalchemy2 import Geometry
 
-# Перевірка, чи існує файл GeoJSON
-file_path = '/home/volodymir/Документи/data.geojson/export.geojson'
-if os.path.exists(file_path):
-    print(f"Файл {file_path} знайдений.")
-else:
-    print(f"Файл {file_path} не знайдений.")
-    exit()
+# Параметри підключення до бази даних PostgreSQL
+db_params = {
+    "dbname": "bus_stops_db",  
+    "user": "postgres",
+    "password": "112233",
+    "host": "localhost",
+    "port": 5432,
+}
 
-# Завантаження GeoJSON
-try:
-    galytskyi_district = gpd.read_file(file_path)
-    print("GeoJSON файл завантажено успішно!")
-except Exception as e:
-    print(f"Помилка завантаження файлу: {e}")
+# Підключення до PostgreSQL через psycopg2
+conn = psycopg2.connect(**db_params)
+cursor = conn.cursor()
 
-# Параметри підключення до бази даних
-dbname = "bus_stops_db"
-user = "postgres"
-password = "112233"
-port = "5432"
-hosts = ["localhost", "127.0.0.1"]
+# SQL запит для вибору відстаней до центру Галицького району і отримання координат
+cursor.execute("""
+    SELECT stop_id, stop_name, ST_X(geom) AS longitude, ST_Y(geom) AS latitude,
+           ST_Distance(geom, 
+                       (SELECT ST_Centroid(geom) 
+                        FROM district_geom 
+                        WHERE name = 'Галицький район' LIMIT 1)
+                       ) AS distance_to_center
+    FROM lvivhal1
+    WHERE ST_Within(geom, 
+                    (SELECT geom FROM district_geom WHERE name = 'Галицький район' LIMIT 1)
+                    );
+""")
 
-# Створення підключення до PostgreSQL через SQLAlchemy
-engine = create_engine(f'postgresql://{user}:{password}@localhost:{port}/{dbname}')
+# Отримання результатів запиту
+stops_with_distances = cursor.fetchall()
 
-# Завантаження зупинок Львова з CSV
-file_path_csv = '/home/volodymir/Документи/зупинки Львова/local_file.csv'
-df = pd.read_csv(file_path_csv, sep=";", encoding="windows-1251")
-df = df[['stop_id', 'settlement', 'stop_code', 'stop_name', 'stop_desc', 'stop_lat', 'stop_lon']]
+# Перетворення результатів у DataFrame
+df = pd.DataFrame(stops_with_distances, columns=['stop_id', 'stop_name', 'longitude', 'latitude', 'distance_to_center'])
 
-# Створення GeoDataFrame для зупинок Львова
-geometry = [Point(xy) for xy in zip(df['stop_lon'], df['stop_lat'])]
-geo_df = gpd.GeoDataFrame(df, geometry=geometry, crs="EPSG:4326")
+# Виведення статистики
+print(df.describe())
 
-# Фільтрація зупинок у межах Галицького району
-stops_in_district = gpd.sjoin(geo_df, galytskyi_district, how="inner", predicate="within")
+# Отримуємо координати центру Галицького району
+cursor.execute("""
+    SELECT ST_X(ST_Centroid(geom)), ST_Y(ST_Centroid(geom))
+    FROM district_geom
+    WHERE name = 'Галицький район' LIMIT 1;
+""")
+center = cursor.fetchone()
+center_longitude = center[0]
+center_latitude = center[1]
 
-# Завантаження даних у таблицю PostgreSQL (стопи Галицького району)
-stops_in_district.to_postgis('stops_in_halytskyi', engine, if_exists='replace')
+# Побудова координатної сітки
+plt.figure(figsize=(10, 6))
+plt.scatter(df['longitude'], df['latitude'], color='red', label='Зупинки', s=10)  # Зупинки
+plt.scatter(center_longitude, center_latitude, color='blue', label='Центр', s=100, marker='*')  # Центр
 
-# Збереження результатів у CSV та GeoJSON
-stops_in_district.to_csv("/home/volodymir/Документи/stops_in_halytskyi.csv", index=False)
-stops_in_district.to_file("/home/volodymir/Документи/stops_in_halytskyi.geojson", driver="GeoJSON")
+plt.title("Зупинки в межах Галицького району")
+plt.xlabel("Довгота")
+plt.ylabel("Широта")
+plt.legend()
+plt.grid(True)
 
-# Карта всіх зупинок Львова
-m_all = folium.Map(location=[df['stop_lat'].mean(), df['stop_lon'].mean()], zoom_start=13)
-for _, row in df.iterrows():
-    folium.Marker([row['stop_lat'], row['stop_lon']], popup=row['stop_name']).add_to(m_all)
+# Збереження графіку
+directory = '/home/volodymir/Документи/тут графіки'
+plt.savefig(f'{directory}/bus_stops_map.png')
 
-m_all.save('/home/volodymir/Документи/map_all_stops.html')
+# Показуємо графік
+plt.show()
 
-# Карта зупинок Галицького району
-m_galytskyi = folium.Map(location=[stops_in_district['stop_lat'].mean(), stops_in_district['stop_lon'].mean()], zoom_start=13)
-for _, row in stops_in_district.iterrows():
-    folium.Marker([row['stop_lat'], row['stop_lon']], popup=row['stop_name']).add_to(m_galytskyi)
+# Закриття підключення до бази даних
+cursor.close()
+conn.close()
 
-m_galytskyi.save('/home/volodymir/Документи/map_halytskyi.html')
