@@ -1,11 +1,11 @@
 import psycopg2
-import pandas as pd
-import matplotlib.pyplot as plt
-import os
+import geopandas as gpd
+from shapely.geometry import Point
+import plotly.graph_objects as go
 
 # Параметри підключення до бази даних PostgreSQL
 db_params = {
-    "dbname": "bus_stops_db",  
+    "dbname": "bus_stops_db",
     "user": "postgres",
     "password": "112233",
     "host": "localhost",
@@ -16,56 +16,68 @@ db_params = {
 conn = psycopg2.connect(**db_params)
 cursor = conn.cursor()
 
-# SQL запит для вибору відстаней до центру Галицького району і отримання координат
+# SQL-запит для отримання зупинок і меж району
 cursor.execute("""
-    SELECT stop_id, stop_name, ST_X(geom) AS longitude, ST_Y(geom) AS latitude,
-           ST_Distance(geom, 
-                       (SELECT ST_Centroid(geom) 
-                        FROM district_geom 
-                        WHERE name = 'Галицький район' LIMIT 1)
-                       ) AS distance_to_center
+    SELECT stop_id, stop_name, ST_X(geom) AS longitude, ST_Y(geom) AS latitude
     FROM lvivhal1
     WHERE ST_Within(geom, 
-                    (SELECT geom FROM district_geom WHERE name = 'Галицький район' LIMIT 1)
-                    );
+                    (SELECT geom 
+                     FROM district_geom 
+                     WHERE name = 'Галицький район' LIMIT 1)
+                   );
 """)
+stops = cursor.fetchall()
 
-# Отримання результатів запиту
-stops_with_distances = cursor.fetchall()
-
-# Перетворення результатів у DataFrame
-df = pd.DataFrame(stops_with_distances, columns=['stop_id', 'stop_name', 'longitude', 'latitude', 'distance_to_center'])
-
-# Виведення статистики
-print(df.describe())
-
-# Отримуємо координати центру Галицького району
 cursor.execute("""
-    SELECT ST_X(ST_Centroid(geom)), ST_Y(ST_Centroid(geom))
+    SELECT ST_AsText(ST_Boundary(geom))
     FROM district_geom
     WHERE name = 'Галицький район' LIMIT 1;
 """)
-center = cursor.fetchone()
-center_longitude = center[0]
-center_latitude = center[1]
+district_boundary_wkt = cursor.fetchone()[0]
 
-# Побудова координатної сітки
-plt.figure(figsize=(10, 6))
-plt.scatter(df['longitude'], df['latitude'], color='red', label='Зупинки', s=10)  # Зупинки
-plt.scatter(center_longitude, center_latitude, color='blue', label='Центр', s=100, marker='*')  # Центр
+# Перетворення зупинок і меж у GeoDataFrame
+stops_gdf = gpd.GeoDataFrame(
+    stops,
+    columns=['stop_id', 'stop_name', 'longitude', 'latitude'],
+    geometry=gpd.points_from_xy([row[2] for row in stops], [row[3] for row in stops]),
+    crs="EPSG:4326"
+)
 
-plt.title("Зупинки в межах Галицького району")
-plt.xlabel("Довгота")
-plt.ylabel("Широта")
-plt.legend()
-plt.grid(True)
+district_boundary = gpd.GeoSeries.from_wkt([district_boundary_wkt], crs="EPSG:4326")
 
-# Збереження графіку
-directory = '/home/volodymir/Документи/тут графіки'
-plt.savefig(f'{directory}/bus_stops_map.png')
+# Перетворення на проєкційну систему координат (UTM для України)
+stops_gdf = stops_gdf.to_crs("EPSG:32634")  # UTM зона 34N (для частини України)
+district_boundary = district_boundary.to_crs("EPSG:32634")
 
-# Показуємо графік
-plt.show()
+# Обчислення відстані до меж району після проєкції
+stops_gdf['distance_to_boundary'] = stops_gdf.geometry.apply(
+    lambda stop: district_boundary.distance(stop).min()
+)
+
+# Виведення результатів
+print(stops_gdf[['stop_name', 'distance_to_boundary']].head())
+
+# Дані для 3D графіка
+x_coords = stops_gdf['longitude'].tolist()
+y_coords = stops_gdf['latitude'].tolist()
+distances = stops_gdf['distance_to_boundary'].tolist()
+
+# Створення 3D графіка
+fig = go.Figure(data=[go.Scatter3d(
+    x=x_coords,
+    y=y_coords,
+    z=distances,
+    mode='markers',
+    marker=dict(size=8, color=distances, colorscale='Viridis', opacity=0.8)
+)])
+
+fig.update_layout(scene=dict(
+    xaxis_title='Довгота',
+    yaxis_title='Широта',
+    zaxis_title='Відстань (м)'
+))
+
+fig.show()
 
 # Закриття підключення до бази даних
 cursor.close()
